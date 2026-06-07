@@ -37,6 +37,7 @@ MAX_HOLD = 60               # trading-day time stop
 COST_PCT = 0.05             # per side (% of trade value)
 TRIM_PCT = 0.25             # book this fraction at the initial target
 ATR_TRAIL = 3.0             # Chandelier trail for the runner (highest high - n*ATR)
+MIN_RR = 1.5                # only trade if reward:risk to next resistance >= this
 
 
 def _signals_for(df: pd.DataFrame) -> pd.DataFrame:
@@ -57,6 +58,8 @@ def _signals_for(df: pd.DataFrame) -> pd.DataFrame:
     # reversal sign used to cut the runner
     d = detect_patterns(d)
     d["bear_rev"] = d["bearish_engulfing"] | d["shooting_star"] | d["evening_star"]
+    # nearest overhead resistance (recent swing peak) for the R:R entry gate
+    d["res_peak"] = d["high"].rolling(120).max().shift(1)
     return d
 
 
@@ -71,48 +74,59 @@ def _entry_reason(row):
 
 def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS,
                  max_alloc_pct=MAX_ALLOC_PCT, max_risk=MAX_RISK, max_hold=MAX_HOLD,
-                 cost_pct=COST_PCT, trim_pct=TRIM_PCT, atr_trail=ATR_TRAIL, progress=True):
+                 cost_pct=COST_PCT, trim_pct=TRIM_PCT, atr_trail=ATR_TRAIL,
+                 min_rr=MIN_RR, exit_style="trail", stocks=None, progress=True):
+    """exit_style: 'trail' (trim 25% + trail) or 'fixed' (full exit at +2R).
+    Pass a prebuilt `stocks` dict to reuse data across exit styles (no re-fetch)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # 1) fetch + compute signals per stock
-    stock = {}   # symbol -> df indexed by date (normalized)
-    events = []  # candidate entries
-
-    def load(sym):
-        try:
-            df = get_history(sym, resolution="D", days=days)
-            if df.empty or len(df) < 220:
-                return None
-            d = _signals_for(df)
-            d.index = d.index.normalize()
-            return sym, d
-        except Exception:
-            return None
-
+    # 1) fetch + compute signals per stock (or reuse a prebuilt `stocks` dict)
     syms = list(symbols)
-    done = 0
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        for fut in as_completed([ex.submit(load, s) for s in syms]):
-            done += 1
-            r = fut.result()
-            if progress and (done % 100 == 0 or done == len(syms)):
-                print(f"  loaded {done}/{len(syms)}")
-            if not r:
+    if stocks is None:
+        stocks = {}
+
+        def load(sym):
+            try:
+                df = get_history(sym, resolution="D", days=days)
+                if df.empty or len(df) < 220:
+                    return None
+                d = _signals_for(df)
+                d.index = d.index.normalize()
+                return sym, d
+            except Exception:
+                return None
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for fut in as_completed([ex.submit(load, s) for s in syms]):
+                done += 1
+                r = fut.result()
+                if progress and (done % 100 == 0 or done == len(syms)):
+                    print(f"  loaded {done}/{len(syms)}")
+                if r:
+                    stocks[r[0]] = r[1]
+
+    stock = stocks
+    # build candidate entries, applying the R:R >= min_rr gate
+    events, watchlisted = [], 0
+    for sym, d in stock.items():
+        for ts, row in d[d["entry_signal"]].iterrows():
+            risk_ps = ATR_MULT_SL * row["atr"]
+            entry = float(row["close"])
+            res = row["res_peak"]
+            rr_res = (res - entry) / risk_ps if (pd.notna(res) and res > entry) else 99.0
+            if rr_res < min_rr:           # not enough room to resistance -> watchlist only
+                watchlisted += 1
                 continue
-            sym, d = r
-            stock[sym] = d
-            sig = d[d["entry_signal"]]
-            for ts, row in sig.iterrows():
-                risk_ps = ATR_MULT_SL * row["atr"]
-                entry = float(row["close"])
-                events.append({
-                    "date": ts, "symbol": sym, "entry": entry,
-                    "risk_ps": float(risk_ps),
-                    "sl": round(entry - risk_ps, 2),
-                    "target": round(entry + RR * risk_ps, 2),
-                    "setup": row["setup"], "vol_ratio": float(row["vol_ratio"]),
-                    "reason": _entry_reason(row),
-                })
+            events.append({
+                "date": ts, "symbol": sym, "entry": entry,
+                "risk_ps": float(risk_ps),
+                "sl": round(entry - risk_ps, 2),
+                "target": round(entry + RR * risk_ps, 2),
+                "rr": round(rr_res, 2) if rr_res < 99 else None,
+                "setup": row["setup"], "vol_ratio": float(row["vol_ratio"]),
+                "reason": _entry_reason(row),
+            })
 
     # 2) portfolio simulation over the unified timeline
     all_dates = sorted({ts for d in stock.values() for ts in d.index})
@@ -173,7 +187,7 @@ def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS
                     record_exit(pos, ts, pos["sl"], f"SL hit @ {pos['sl']}", i)
                 elif hi >= pos["target"]:
                     trim_qty = int(round(pos["initial_qty"] * trim_pct))
-                    if trim_qty < 1 or trim_qty >= pos["qty"]:
+                    if exit_style == "fixed" or trim_qty < 1 or trim_qty >= pos["qty"]:
                         record_exit(pos, ts, pos["target"],
                                     f"target @ {pos['target']} (full exit)", i)
                     else:
@@ -255,12 +269,14 @@ def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS
 
     stats = _stats(trades, equity, capital, all_dates, len(open_pos))
     return {"trades": sorted(trades, key=lambda t: t["entry_date"]),
-            "equity": equity, "stats": stats,
+            "equity": equity, "stats": stats, "stocks": stock,
+            "watchlisted": watchlisted,
             "params": {"capital": capital, "max_positions": max_positions,
                        "max_alloc_pct": max_alloc_pct, "max_risk": max_risk,
                        "atr_mult_sl": ATR_MULT_SL, "rr": RR, "max_hold": max_hold,
                        "cost_pct": cost_pct, "trim_pct": trim_pct,
-                       "atr_trail": atr_trail, "universe_size": len(syms)}}
+                       "atr_trail": atr_trail, "min_rr": min_rr,
+                       "exit_style": exit_style, "universe_size": len(syms)}}
 
 
 def _stats(trades, equity, capital, all_dates, open_count):

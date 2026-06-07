@@ -43,15 +43,14 @@ tr:hover td{background:#18222e}.r{text-align:right}.c{text-align:center}
 """
 
 
-def draw_equity(equity, capital, path):
-    s = pd.Series(equity).sort_index()
+def draw_equity(series_map, capital, path):
+    colors = {"Trim + trail": "#5fd39a", "Fixed +2R": "#5aa9ff"}
     fig, ax = plt.subplots(figsize=(11, 4.2))
-    ax.plot(s.index, s.values, color="#5fd39a", lw=1.6)
+    for label, eq in series_map.items():
+        s = pd.Series(eq).sort_index()
+        ax.plot(s.index, s.values, lw=1.7, label=label, color=colors.get(label))
     ax.axhline(capital, color="#6b7686", ls="--", lw=0.9, label="Start ₹50L")
-    peak = s.cummax()
-    ax.fill_between(s.index, s.values, peak.values, where=(s < peak),
-                    color="#e07a6a", alpha=0.15, label="Drawdown")
-    ax.set_title("Portfolio Equity Curve", color="#e6e9ee")
+    ax.set_title("Portfolio Equity Curve — Trim+Trail vs Fixed +2R", color="#e6e9ee")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.15)
     fig.autofmt_xdate()
@@ -109,7 +108,26 @@ def write_trades_csv(trades, path):
             w.writerow([row.get(c) for c in cols])
 
 
-def build_html(res, when):
+def cmp_table(res_trail, res_fixed):
+    s, f = res_trail["stats"], res_fixed["stats"]
+    rows = [
+        ("End equity", f"₹{s['end_equity']:,.0f}", f"₹{f['end_equity']:,.0f}"),
+        ("Total return", f"{s['total_return_pct']}%", f"{f['total_return_pct']}%"),
+        ("CAGR", f"{s['cagr_pct']}%", f"{f['cagr_pct']}%"),
+        ("Win rate", f"{s['win_rate_pct']}%", f"{f['win_rate_pct']}%"),
+        ("Profit factor", f"{s['profit_factor']}", f"{f['profit_factor']}"),
+        ("Avg R", f"{s['avg_r']}", f"{f['avg_r']}"),
+        ("Max drawdown", f"{s['max_drawdown_pct']}%", f"{f['max_drawdown_pct']}%"),
+        ("Trades", f"{s['total_trades']}", f"{f['total_trades']}"),
+    ]
+    body = "".join(f"<tr><td>{m}</td><td class='r'>{a}</td><td class='r'>{b}</td></tr>"
+                   for m, a, b in rows)
+    return ("<table style='max-width:520px'><thead><tr><th>Metric</th>"
+            "<th class='r'>Trim + trail</th><th class='r'>Fixed +2R</th></tr></thead>"
+            f"<tbody>{body}</tbody></table>")
+
+
+def build_html(res, res_fixed, when):
     s, p = res["stats"], res["params"]
     rc = _color(s["total_return_pct"])
 
@@ -140,9 +158,13 @@ def build_html(res, when):
 <a href="index.html">← back to screener</a> · <a href="trades.csv">download all trades</a></p>
 <div class="cards">{cards}</div>
 <img src="equity.png" alt="Equity curve">
+<h3 style="margin:18px 0 6px">Exit-style comparison (same entries, same universe)</h3>
+{cmp_table(res, res_fixed)}
 <h3 style="margin:18px 0 6px">Rules</h3>
 <p class="sub">Capital ₹{p['capital']:,.0f} · max {p['max_positions']} positions ·
 max {p['max_alloc_pct']}% equity/stock · max ₹{p['max_risk']:,.0f} risk/stock ·
+<b>only traded if reward:risk to next resistance ≥ {p['min_rr']}</b> (others go to
+watchlist; {res['watchlisted']:,} signals watch-listed this run) ·
 SL = entry − {p['atr_mult_sl']}×ATR. At the +{p['rr']}R target, <b>trim
 {int(p['trim_pct']*100)}%</b>, move the rest to breakeven and <b>let the winner run</b>
 with a {p['atr_trail']}×ATR Chandelier trail — cutting on a reversal (close &lt; EMA20 or
@@ -163,18 +185,23 @@ def main():
 
     symbols = resolve_universe(args.universe)
     print(f"Backtesting {len(symbols)} symbols over {args.days} days...")
-    res = run_backtest(symbols, days=args.days)
+    res = run_backtest(symbols, days=args.days, exit_style="trail")
+    # reuse the fetched/computed data to run the comparison style (no re-fetch)
+    res_fixed = run_backtest(symbols, days=args.days, exit_style="fixed",
+                             stocks=res["stocks"], progress=False)
 
     os.makedirs(SITE_DIR, exist_ok=True)
-    draw_equity(res["equity"], res["params"]["capital"], os.path.join(SITE_DIR, "equity.png"))
+    draw_equity({"Trim + trail": res["equity"], "Fixed +2R": res_fixed["equity"]},
+                res["params"]["capital"], os.path.join(SITE_DIR, "equity.png"))
     write_trades_csv(res["trades"], os.path.join(SITE_DIR, "trades.csv"))
     when = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
     with open(os.path.join(SITE_DIR, "performance.html"), "w") as f:
-        f.write(build_html(res, when))
+        f.write(build_html(res, res_fixed, when))
 
-    s = res["stats"]
-    print(f"Done. Equity ₹{s['end_equity']:,.0f} | return {s['total_return_pct']}% | "
-          f"win {s['win_rate_pct']}% | trades {s['total_trades']}")
+    s, f = res["stats"], res_fixed["stats"]
+    print(f"Trim+trail: ₹{s['end_equity']:,.0f} ({s['total_return_pct']}%, win {s['win_rate_pct']}%) | "
+          f"Fixed+2R: ₹{f['end_equity']:,.0f} ({f['total_return_pct']}%) | "
+          f"watchlisted {res['watchlisted']}")
     print(f"Wrote {SITE_DIR}/performance.html, equity.png, trades.csv")
 
 
