@@ -28,7 +28,7 @@ from fyers_apiv3 import fyersModel
 from envtools import load_env, set_env_value
 
 VAGATOR = "https://api-t2.fyers.in/vagator/v2"
-TOKEN_URL = "https://api.fyers.in/api/v2/token"
+TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
 
 
 def _b64(value) -> str:
