@@ -1,0 +1,8 @@
+fyers-apiv3==2.0.2
+pandas
+numpy
+pyotp
+requests
+# charting (used by analyze.py --chart locally; not needed for the website build)
+matplotlib
+mplfinance

@@ -1,0 +1,22 @@
+# SECRETS — never commit
+.env
+
+# generated / local artifacts
+.cache/
+site/
+outputs/
+charts/
+logs/
+paper.db
+*.png
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# SDK / app logs
+*.log
+fyersApi.log
+fyersRequests.log
