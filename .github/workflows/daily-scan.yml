@@ -20,7 +20,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -52,6 +52,9 @@ jobs:
 
       - name: Build screener website
         run: python build_site.py --universe nse_all --min-value 10 --top 80
+
+      - name: Build performance dashboard
+        run: python build_performance.py --universe nse_all --days 500
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
