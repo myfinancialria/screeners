@@ -23,6 +23,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
+from candles import detect_patterns
 from history import get_history
 from indicators import add_indicators
 
@@ -31,9 +32,11 @@ MAX_POSITIONS = 25
 MAX_ALLOC_PCT = 4.0          # % of equity per stock
 MAX_RISK = 10_000.0          # ₹ risk per stock
 ATR_MULT_SL = 1.5
-RR = 2.0                     # target = entry + RR * risk
+RR = 2.0                     # initial target = entry + RR * risk
 MAX_HOLD = 60               # trading-day time stop
 COST_PCT = 0.05             # per side (% of trade value)
+TRIM_PCT = 0.25             # book this fraction at the initial target
+ATR_TRAIL = 3.0             # Chandelier trail for the runner (highest high - n*ATR)
 
 
 def _signals_for(df: pd.DataFrame) -> pd.DataFrame:
@@ -50,6 +53,10 @@ def _signals_for(df: pd.DataFrame) -> pd.DataFrame:
 
     d["entry_signal"] = (breakout | pullback) & (d["atr"] > 0)
     d["setup"] = np.where(breakout, "BREAKOUT", np.where(pullback, "PULLBACK", ""))
+
+    # reversal sign used to cut the runner
+    d = detect_patterns(d)
+    d["bear_rev"] = d["bearish_engulfing"] | d["shooting_star"] | d["evening_star"]
     return d
 
 
@@ -64,7 +71,7 @@ def _entry_reason(row):
 
 def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS,
                  max_alloc_pct=MAX_ALLOC_PCT, max_risk=MAX_RISK, max_hold=MAX_HOLD,
-                 cost_pct=COST_PCT, progress=True):
+                 cost_pct=COST_PCT, trim_pct=TRIM_PCT, atr_trail=ATR_TRAIL, progress=True):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # 1) fetch + compute signals per stock
@@ -120,47 +127,86 @@ def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS
     trades = []
     equity = {}
 
-    def ohlc(sym, ts):
+    def bar(sym, ts):
         d = stock[sym]
         if ts in d.index:
             r = d.loc[ts]
-            return float(r["high"]), float(r["low"]), float(r["close"])
+            return (float(r["high"]), float(r["low"]), float(r["close"]),
+                    float(r["ema20"]), float(r["atr"]), bool(r["bear_rev"]))
         return None
 
+    def close_on(sym, ts):
+        b = bar(sym, ts)
+        return b[2] if b else None
+
+    def record_exit(pos, ts, price, reason, i):
+        """Close the remaining qty; fold in any earlier trim for one trade row."""
+        nonlocal cash, realized
+        cash += pos["qty"] * price * (1 - cost_pct / 100)
+        trim = pos.get("trim_info")
+        net_final = pos["qty"] * price * (1 - cost_pct / 100)
+        net_trim = trim["proceeds"] if trim else 0.0
+        pnl = net_final + net_trim - pos["cost_basis"]
+        if trim:
+            reason = (f"Trimmed {trim['qty']} (25%) @ {trim['price']} on "
+                      f"{trim['date']:%d-%b}; runner {reason}")
+        realized += pnl
+        trades.append({**pos, "exit_date": ts, "exit_price": round(price, 2),
+                       "exit_reason": reason, "status": "CLOSED",
+                       "pnl": round(pnl, 2),
+                       "ret_pct": round(pnl / pos["cost_basis"] * 100, 2),
+                       "r_multiple": round(pnl / pos["risk_amt"], 2),
+                       "bars_held": i - pos["entry_i"]})
+        del open_pos[pos["symbol"]]
+
     for i, ts in enumerate(all_dates):
-        # ---- exits first ----
+        # ---- exits / scale-out first ----
         for sym in list(open_pos):
             pos = open_pos[sym]
-            row = ohlc(sym, ts)
-            if row is None:
+            b = bar(sym, ts)
+            if b is None:
                 continue
-            hi, lo, cl = row
-            exit_price = exit_reason = None
-            if lo <= pos["sl"]:
-                exit_price, exit_reason = pos["sl"], f"SL hit @ {pos['sl']}"
-            elif hi >= pos["target"]:
-                exit_price, exit_reason = pos["target"], f"Target hit @ {pos['target']} (+2R)"
-            elif i - pos["entry_i"] >= max_hold:
-                exit_price, exit_reason = round(cl, 2), f"Time exit ({max_hold}d) @ {cl:.2f}"
-            if exit_price is not None:
-                proceeds = pos["qty"] * exit_price * (1 - cost_pct / 100)
-                cash += proceeds
-                pnl = proceeds - pos["cost_basis"]
-                realized += pnl
-                trades.append({**pos, "exit_date": ts, "exit_price": exit_price,
-                               "exit_reason": exit_reason, "status": "CLOSED",
-                               "pnl": round(pnl, 2),
-                               "ret_pct": round(pnl / pos["cost_basis"] * 100, 2),
-                               "r_multiple": round(pnl / pos["risk_amt"], 2),
-                               "bars_held": i - pos["entry_i"]})
-                del open_pos[sym]
+            hi, lo, cl, ema20, atr, bear = b
+
+            if not pos["trimmed"]:
+                if lo <= pos["sl"]:
+                    record_exit(pos, ts, pos["sl"], f"SL hit @ {pos['sl']}", i)
+                elif hi >= pos["target"]:
+                    trim_qty = int(round(pos["initial_qty"] * trim_pct))
+                    if trim_qty < 1 or trim_qty >= pos["qty"]:
+                        record_exit(pos, ts, pos["target"],
+                                    f"target @ {pos['target']} (full exit)", i)
+                    else:
+                        proceeds = trim_qty * pos["target"] * (1 - cost_pct / 100)
+                        cash += proceeds
+                        pos["qty"] -= trim_qty
+                        pos["trimmed"] = True
+                        pos["sl"] = pos["entry"]           # runner to breakeven
+                        pos["highest_high"] = max(hi, pos["entry"])
+                        pos["trim_info"] = {"qty": trim_qty, "price": pos["target"],
+                                            "date": ts, "proceeds": proceeds,
+                                            "proceeds_gross": trim_qty * pos["target"]}
+                elif i - pos["entry_i"] >= max_hold:
+                    record_exit(pos, ts, round(cl, 2), f"time exit ({max_hold}d)", i)
+            else:
+                # runner: trail the highest high (Chandelier), cut on reversal
+                pos["highest_high"] = max(pos["highest_high"], hi)
+                trail = max(pos["entry"], pos["highest_high"] - atr_trail * atr)
+                pos["sl"] = max(pos["sl"], trail)
+                if lo <= pos["sl"]:
+                    record_exit(pos, ts, pos["sl"], f"trail-stop @ {round(pos['sl'],2)}", i)
+                elif cl < ema20 or bear:
+                    why = "close<EMA20" if cl < ema20 else "bearish reversal candle"
+                    record_exit(pos, ts, round(cl, 2), f"reversal exit ({why}) @ {cl:.2f}", i)
+                elif i - pos["entry_i"] >= max_hold:
+                    record_exit(pos, ts, round(cl, 2), f"time exit ({max_hold}d)", i)
 
         # ---- entries ----
         todays = sorted(events_by_date.get(ts, []), key=lambda e: e["vol_ratio"], reverse=True)
         for e in todays:
             if len(open_pos) >= max_positions or e["symbol"] in open_pos:
                 continue
-            equity_now = cash + sum(p["qty"] * (ohlc(s, ts)[2] if ohlc(s, ts) else p["entry"])
+            equity_now = cash + sum(p["qty"] * (close_on(s, ts) or p["entry"])
                                     for s, p in open_pos.items())
             qty_risk = int(max_risk // e["risk_ps"]) if e["risk_ps"] > 0 else 0
             qty_cap = int((max_alloc_pct / 100 * equity_now) // e["entry"])
@@ -176,25 +222,32 @@ def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS
             cash -= cost_basis
             open_pos[e["symbol"]] = {
                 "symbol": e["symbol"], "setup": e["setup"], "entry_date": ts,
-                "entry": e["entry"], "qty": qty, "value": round(qty * e["entry"], 2),
+                "entry": e["entry"], "qty": qty, "initial_qty": qty,
+                "value": round(qty * e["entry"], 2),
                 "sl": e["sl"], "target": e["target"], "risk_ps": round(e["risk_ps"], 2),
                 "risk_amt": round(qty * e["risk_ps"], 2), "cost_basis": cost_basis,
                 "entry_i": i, "reason": e["reason"],
+                "trimmed": False, "highest_high": e["entry"], "trim_info": None,
             }
 
         # ---- mark to market ----
-        mtm = sum(p["qty"] * (ohlc(s, ts)[2] if ohlc(s, ts) else p["entry"])
+        mtm = sum(p["qty"] * (close_on(s, ts) or p["entry"])
                   for s, p in open_pos.items())
         equity[ts] = round(cash + mtm, 2)
 
     # open positions left at the end -> record as OPEN (marked to last close)
     last_ts = all_dates[-1] if all_dates else None
     for sym, pos in open_pos.items():
-        row = ohlc(sym, last_ts)
-        cl = row[2] if row else pos["entry"]
-        pnl = pos["qty"] * cl - pos["cost_basis"]
+        cl = close_on(sym, last_ts) or pos["entry"]
+        trim = pos.get("trim_info")
+        net_trim = trim["proceeds"] if trim else 0.0
+        pnl = pos["qty"] * cl + net_trim - pos["cost_basis"]
+        reason = "Open (marked to market)"
+        if trim:
+            reason = (f"Trimmed {trim['qty']} (25%) @ {trim['price']} on "
+                      f"{trim['date']:%d-%b}; runner open (MTM)")
         trades.append({**pos, "exit_date": None, "exit_price": round(cl, 2),
-                       "exit_reason": "Open (marked to market)", "status": "OPEN",
+                       "exit_reason": reason, "status": "OPEN",
                        "pnl": round(pnl, 2),
                        "ret_pct": round(pnl / pos["cost_basis"] * 100, 2),
                        "r_multiple": round(pnl / pos["risk_amt"], 2),
@@ -206,7 +259,8 @@ def run_backtest(symbols, days=500, capital=CAPITAL, max_positions=MAX_POSITIONS
             "params": {"capital": capital, "max_positions": max_positions,
                        "max_alloc_pct": max_alloc_pct, "max_risk": max_risk,
                        "atr_mult_sl": ATR_MULT_SL, "rr": RR, "max_hold": max_hold,
-                       "cost_pct": cost_pct, "universe_size": len(syms)}}
+                       "cost_pct": cost_pct, "trim_pct": trim_pct,
+                       "atr_trail": atr_trail, "universe_size": len(syms)}}
 
 
 def _stats(trades, equity, capital, all_dates, open_count):

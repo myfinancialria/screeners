@@ -78,7 +78,7 @@ def trade_rows(trades, limit=200):
         tag = "#5fd39a" if t["status"] == "CLOSED" and t["pnl"] > 0 else (
             "#e07a6a" if t["status"] == "CLOSED" else "#e6b35a")
         note = (f"<b>Entry:</b> {t['reason']}. "
-                f"<b>Target:</b> {t['target']} (+2R, 1:2). "
+                f"<b>Target:</b> {t['target']} (+2R — trim 25%, trail the rest). "
                 f"<b>Exit:</b> {t['exit_reason']}.")
         out.append(
             "<tr>"
@@ -143,8 +143,11 @@ def build_html(res, when):
 <h3 style="margin:18px 0 6px">Rules</h3>
 <p class="sub">Capital ₹{p['capital']:,.0f} · max {p['max_positions']} positions ·
 max {p['max_alloc_pct']}% equity/stock · max ₹{p['max_risk']:,.0f} risk/stock ·
-SL = entry − {p['atr_mult_sl']}×ATR · Target = +{p['rr']}R · {p['max_hold']}-day time stop ·
-{p['cost_pct']}% cost/side. Entries on BREAKOUT &amp; PULLBACK setups at signal-day close.</p>
+SL = entry − {p['atr_mult_sl']}×ATR. At the +{p['rr']}R target, <b>trim
+{int(p['trim_pct']*100)}%</b>, move the rest to breakeven and <b>let the winner run</b>
+with a {p['atr_trail']}×ATR Chandelier trail — cutting on a reversal (close &lt; EMA20 or
+a bearish reversal candle). {p['max_hold']}-day time stop · {p['cost_pct']}% cost/side.
+Entries on BREAKOUT &amp; PULLBACK setups at signal-day close.</p>
 <h3 style="margin:18px 0 6px">Trades <span style="color:#6b7686">(latest {shown} of {len(res['trades'])})</span></h3>
 <table><thead><tr>{head}</tr></thead><tbody>{trade_rows(res['trades'])}</tbody></table>
 <p class="foot">Backtest with no look-ahead (point-in-time signals). Past performance
