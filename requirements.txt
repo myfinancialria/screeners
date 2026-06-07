@@ -1,4 +1,4 @@
-fyers-apiv3==2.0.2
+fyers-apiv3==3.1.13
 pandas
 numpy
 pyotp
