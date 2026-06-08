@@ -155,7 +155,7 @@ def build_html(res, res_fixed, when):
 <body><div class="wrap">
 <h1>📊 Screener Performance (Backtest)</h1>
 <p class="sub">{s['period']} · {p['universe_size']} stocks · updated {when} IST ·
-<a href="index.html">← back to screener</a> · <a href="trades.csv">download all trades</a></p>
+<a href="index.html">🏠 Home</a> · <a href="screener.html">← screener</a> · <a href="trades.csv">download all trades</a></p>
 <div class="cards">{cards}</div>
 <img src="equity.png" alt="Equity curve">
 <h3 style="margin:18px 0 6px">Exit-style comparison (same entries, same universe)</h3>

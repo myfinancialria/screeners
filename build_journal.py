@@ -164,7 +164,9 @@ def build():
     out = SITE / "journal.html"
     out.write_text(page, encoding="utf-8")
     write_csv(trades, SITE / "journal.csv")
+    write_landing(trades, st, per, now)
     print(f"Wrote {out}")
+    print(f"Wrote {SITE / 'index.html'} (landing)")
     print(f"Wrote {SITE / 'journal.csv'}")
     print(f"Net P&L {_fmt(st['net'], money=True)} ({st['ret_pct']:+.2f}%) over "
           f"{st['n_closed']} closed trades, {st['n_open']} open.")
@@ -235,6 +237,109 @@ per underlying per day · all positions squared off by 15:25. Simulated fills on
 day's real 5-min candles — no real orders.</p>
 """
 
+def write_landing(trades, st, per, now):
+    """The public front door (index.html): headline performance + recent trades."""
+    cards = [
+        ("Net P&L", _fmt(st["net"], money=True), st["net"] >= 0),
+        ("Return on capital", f"{st['ret_pct']:+.2f}%", st["ret_pct"] >= 0),
+        ("Win rate", f"{st['win_rate']:.1f}%", st["win_rate"] >= 50),
+        ("Profit factor", _fmt(st["pf"]), st["pf"] >= 1),
+        ("Closed trades", f"{st['n_closed']}", None),
+        ("Max drawdown", _fmt(st["max_dd"], money=True), False),
+    ]
+    card_html = "".join(
+        f'<div class="card"><div class="cap">{html.escape(lbl)}</div>'
+        f'<div class="val {"pos" if g else ("neg" if g is False else "")}">{v}</div></div>'
+        for lbl, v, g in cards)
+
+    closed = [t for t in trades if t["status"] == "CLOSED"]
+    recent = list(reversed(closed))[:10]
+    rrows = []
+    for t in recent:
+        cls = "pos" if (t["pnl"] or 0) >= 0 else "neg"
+        rrows.append(
+            f"<tr><td>{html.escape(t['date'])}</td><td><b>{html.escape(t['strategy'])}</b></td>"
+            f"<td>{html.escape(t['underlying'])} {html.escape(t['opt_kind'])}</td>"
+            f"<td class='r {cls}'>{_fmt(t['pnl'], money=True)}</td>"
+            f"<td class='r {cls}'>{t['r_multiple']:+.2f}R</td></tr>"
+            if t["r_multiple"] is not None else
+            f"<tr><td>{html.escape(t['date'])}</td><td><b>{html.escape(t['strategy'])}</b></td>"
+            f"<td>{html.escape(t['underlying'])} {html.escape(t['opt_kind'])}</td>"
+            f"<td class='r {cls}'>{_fmt(t['pnl'], money=True)}</td><td class='r'>—</td></tr>")
+    recent_html = ("<table><tr><th>Date</th><th>Strategy</th><th>Instrument</th>"
+                   "<th class='r'>P&L</th><th class='r'>R</th></tr>"
+                   + ("".join(rrows) or "<tr><td colspan=5 class='muted'>First session "
+                      "pending — trades appear here automatically after market close.</td></tr>")
+                   + "</table>")
+
+    (SITE / "index.html").write_text(
+        LANDING.format(now=now, capital=_fmt(st["capital"], money=True),
+                       cards=card_html, recent=recent_html), encoding="utf-8")
+
+
+LANDING = """<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Option Strategy Lab — Automated Paper Trading</title>
+<style>
+ :root{{--bg:#0e1117;--panel:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;
+        --pos:#3fb950;--neg:#f85149;--accent:#58a6ff}}
+ *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--fg);
+   font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial}}
+ .wrap{{max-width:980px;margin:0 auto;padding:0 18px 64px}}
+ .hero{{padding:54px 0 26px;text-align:center;border-bottom:1px solid var(--bd)}}
+ .hero h1{{margin:0;font-size:32px;letter-spacing:-.5px}}
+ .hero p{{color:var(--mut);max-width:640px;margin:12px auto 0;font-size:15px}}
+ .pill{{display:inline-block;margin-top:16px;padding:5px 12px;border:1px solid var(--bd);
+   border-radius:999px;color:var(--mut);font-size:12.5px}}
+ .pill b{{color:var(--pos)}}
+ .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:28px 0}}
+ .card{{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:16px}}
+ .cap{{color:var(--mut);font-size:12px}} .val{{font-size:24px;font-weight:700;margin-top:6px}}
+ .pos{{color:var(--pos)}} .neg{{color:var(--neg)}} .muted{{color:var(--mut)}}
+ h2{{font-size:16px;margin:30px 0 10px}}
+ table{{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--bd);
+   border-radius:10px;overflow:hidden;font-size:13.5px}}
+ th,td{{text-align:left;padding:9px 12px;border-bottom:1px solid var(--bd)}}
+ th{{color:var(--mut);font-weight:600}} .r{{text-align:right}}
+ .tiles{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin:14px 0}}
+ a.tile{{display:block;background:var(--panel);border:1px solid var(--bd);border-radius:12px;
+   padding:18px;text-decoration:none;color:var(--fg);transition:border-color .15s}}
+ a.tile:hover{{border-color:var(--accent)}}
+ a.tile .t{{font-weight:700;font-size:15px}} a.tile .d{{color:var(--mut);font-size:12.5px;margin-top:4px}}
+ .arrow{{color:var(--accent)}}
+ .disc{{margin-top:30px;color:var(--mut);font-size:11.5px;border-top:1px solid var(--bd);padding-top:14px}}
+</style></head><body>
+<div class="hero"><div class="wrap" style="padding-top:0">
+ <h1>📈 Option Strategy Lab</h1>
+ <p>Four researched option-BUYING strategies — ORB, 5 EMA (Power of Stocks), Expiry
+    Gamma and OI+Gap — traded automatically on NIFTY &amp; SENSEX as paper trades, with
+    every entry, exit and stop journalled in full. Updated daily after market close.</p>
+ <div class="pill">Virtual capital {capital} · automated · simulated, no real orders</div>
+</div></div>
+<div class="wrap">
+ <div class="cards">{cards}</div>
+
+ <h2>Recent trades</h2>
+ {recent}
+
+ <h2>Explore</h2>
+ <div class="tiles">
+   <a class="tile" href="journal.html"><div class="t">🤖 Strategy Journal <span class="arrow">→</span></div>
+     <div class="d">Every trade with the reason it entered, its target &amp; stop logic, and the exit.</div></a>
+   <a class="tile" href="journal.html"><div class="t">📚 The Strategies <span class="arrow">→</span></div>
+     <div class="d">How each of the four setups defines entry, target and stop-loss.</div></a>
+   <a class="tile" href="screener.html"><div class="t">📈 NSE Bullish Screener <span class="arrow">→</span></div>
+     <div class="d">Daily scan of NSE stocks for breakout, pre-breakout and pullback setups.</div></a>
+   <a class="tile" href="performance.html"><div class="t">📊 Screener Performance <span class="arrow">→</span></div>
+     <div class="d">Event-driven backtest of the screener's setups — equity curve and stats.</div></a>
+ </div>
+
+ <div class="disc">Educational simulation only. Option buying carries a high risk of loss
+  (time decay / IV crush); SEBI studies show a large majority of F&amp;O traders lose money.
+  Past simulated results do not predict future performance. Updated {now}.</div>
+</div></body></html>"""
+
+
 TEMPLATE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Strategy Paper-Trading Journal</title>
@@ -270,7 +375,7 @@ TEMPLATE = """<!doctype html><html lang="en"><head>
 </style></head><body>
 <header><h1>Strategy Paper-Trading Journal</h1>
  <div class="sub">Virtual capital {capital} · option-buying engine (ORB · 5 EMA · Expiry Gamma · OI+Gap) · updated {now} · simulated, no real orders</div>
- <div class="nav"><a href="index.html">← NSE Bullish Screener</a> · <a href="performance.html">📊 Screener performance</a></div>
+ <div class="nav"><a href="index.html">🏠 Home</a> · <a href="screener.html">NSE Bullish Screener</a> · <a href="performance.html">📊 Screener performance</a></div>
 </header>
 <div class="tabs">
  <div class="tab active" data-v="overall">Overall Return</div>
