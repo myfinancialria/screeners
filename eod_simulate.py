@@ -33,8 +33,9 @@ import journal_db as J
 import strategies as S
 from fyers_data import resolve_fo
 from history import get_history
-from live_trade import (HARD_STOP_PCT, IST, UNDERLYINGS, atm_strike, fetch_oi,
-                        nearest_option_expiry_epoch, size_lots)
+from live_trade import (FUT_STRATEGIES, HARD_STOP_PCT, IST, STOCK_FUTURES,
+                        UNDERLYINGS, atm_strike, fetch_oi,
+                        nearest_option_expiry_epoch, size_lots, size_lots_fut)
 
 NO_NEW_ENTRY_AFTER = dt.time(15, 20)   # stop opening fresh trades near the close
 SQUAREOFF_AFTER = dt.time(15, 25)
@@ -66,22 +67,24 @@ def is_expiry_day(name, exch, date, today):
 
 
 def intrabar_exit(pos, idx_c, opt_c, t):
-    """Return (exit_premium, reason) if this bar trips an exit, else (None, None)."""
-    kind = pos["opt_kind"]
+    """Return (exit_price, reason) if this bar trips an exit, else (None, None).
+    For options idx_c is the index bar and opt_c the option bar; for futures both
+    are the same future bar. `bullish` = long the underlying move (CE or LONG)."""
+    bullish = pos["opt_kind"] == "CE" or pos.get("side") == "LONG"
     if pos["sl_prem"] is not None and opt_c["low"] <= pos["sl_prem"]:
         return pos["sl_prem"], f"Stop hit — premium ₹{pos['sl_prem']:.2f} touched"
     if pos["target_prem"] is not None and opt_c["high"] >= pos["target_prem"]:
         return pos["target_prem"], f"Target hit — premium ₹{pos['target_prem']:.2f} touched"
     if pos["sl_spot"] is not None:
-        if kind == "CE" and idx_c["low"] <= pos["sl_spot"]:
-            return float(opt_c["close"]), f"Stop hit — spot {pos['sl_spot']:.1f} touched"
-        if kind == "PE" and idx_c["high"] >= pos["sl_spot"]:
-            return float(opt_c["close"]), f"Stop hit — spot {pos['sl_spot']:.1f} touched"
+        if bullish and idx_c["low"] <= pos["sl_spot"]:
+            return float(opt_c["close"]), f"Stop hit — price {pos['sl_spot']:.1f} touched"
+        if not bullish and idx_c["high"] >= pos["sl_spot"]:
+            return float(opt_c["close"]), f"Stop hit — price {pos['sl_spot']:.1f} touched"
     if pos["target_spot"] is not None:
-        if kind == "CE" and idx_c["high"] >= pos["target_spot"]:
-            return float(opt_c["close"]), f"Target hit — spot {pos['target_spot']:.1f} touched"
-        if kind == "PE" and idx_c["low"] <= pos["target_spot"]:
-            return float(opt_c["close"]), f"Target hit — spot {pos['target_spot']:.1f} touched"
+        if bullish and idx_c["high"] >= pos["target_spot"]:
+            return float(opt_c["close"]), f"Target hit — price {pos['target_spot']:.1f} touched"
+        if not bullish and idx_c["low"] <= pos["target_spot"]:
+            return float(opt_c["close"]), f"Target hit — price {pos['target_spot']:.1f} touched"
     if pos["time_exit_min"]:
         if (t - pos["entry_t"]).total_seconds() >= pos["time_exit_min"] * 60:
             return float(opt_c["close"]), f"Time exit — {pos['time_exit_min']} min elapsed"
@@ -218,6 +221,99 @@ def _enter(ctx, strat, sig, t, capital, opt_cache):
             "target_spot": sig.target_spot, "time_exit_min": sig.time_exit_min}
 
 
+def _enter_fut(ctx, strat, sig, t, capital, price_cache):
+    if sig.sl_spot is None or sig.target_spot is None:
+        return None
+    fut_sym = next(iter(price_cache))               # the one future being replayed
+    bar = _row_at(price_cache[fut_sym], t)
+    if bar is None:
+        return None
+    price = float(bar["close"])
+    if price <= 0:
+        return None
+    lot_size = price_cache["__lot__"]
+    side = "LONG" if sig.opt_kind == "CE" else "SHORT"
+    lots = size_lots_fut(capital, price, sig.sl_spot, lot_size)
+    qty = lots * lot_size
+    risk_amt = abs(price - sig.sl_spot) * qty
+    remark = (sig.entry_remarks.replace("Bought ATM CE.", f"Went LONG {ctx.underlying} future.")
+              .replace("Bought ATM PE.", f"Went SHORT {ctx.underlying} future."))
+    tid = J.open_trade(
+        date=t.strftime("%Y-%m-%d"), strategy=strat, underlying=ctx.underlying,
+        exchange="NSE", instrument_type="FUT", opt_symbol=fut_sym, opt_kind="FUT",
+        side=side, strike=None, lots=lots, lot_size=lot_size, qty=qty,
+        entry_ts=t.isoformat(timespec="seconds"), entry_spot=price, entry_prem=price,
+        sl_spot=sig.sl_spot, target_spot=sig.target_spot, sl_prem=None, target_prem=None,
+        time_exit_min=None, risk_amt=risk_amt, entry_remarks=remark,
+        entry_logic=sig.entry_logic, sl_logic=sig.sl_logic, exit_logic=sig.exit_logic)
+    print(f"      ➜ {strat} {ctx.underlying} FUT {side} {lots}×{lot_size} @ ₹{price:.2f} "
+          f"(#{tid}) — {t:%H:%M}")
+    return {"id": tid, "opt_symbol": fut_sym, "opt_kind": "FUT", "side": side,
+            "entry_prem": price, "entry_t": t, "sl_prem": None, "target_prem": None,
+            "sl_spot": sig.sl_spot, "target_spot": sig.target_spot, "time_exit_min": None}
+
+
+def replay_future(stock, date, today):
+    date_str = date.strftime("%Y-%m-%d")
+    try:
+        fut_sym, lot_size, _ = resolve_fo(stock, "FUT", exchange="NSE")
+    except (Exception, SystemExit) as e:
+        print(f"  · {stock} FUT: no contract ({e})")
+        return
+    fut = _today_rows(get_history(fut_sym, "5", days=6), date)
+    if fut is None or fut.empty:
+        print(f"  · {stock} FUT: no intraday data for {date_str}")
+        return
+    today_open = float(fut["open"].iloc[0])
+    daily = get_history(fut_sym, "D", days=20)
+    prior = daily[[ix.date() < date for ix in daily.index]]
+    prev_close = float(prior["close"].iloc[-1]) if not prior.empty else today_open
+    capital = J.get_capital()
+    price_cache = {fut_sym: fut, "__lot__": lot_size}   # future is its own price/fill series
+    open_pos = {}
+    print(f"  · {stock} FUT {date_str}: {len(fut)} bars, prev_close {prev_close:.1f}")
+
+    times = list(fut.index)
+    for i, t in enumerate(times):
+        bar = fut.iloc[i]
+        eval_now = t + dt.timedelta(minutes=5)
+        fut_upto = fut.iloc[: i + 1]
+        for strat in list(open_pos):
+            pos = open_pos[strat]
+            ex_prem, reason = intrabar_exit(pos, bar, bar, t)  # idx_c == opt_c == future bar
+            if ex_prem is not None:
+                J.close_trade(pos["id"], t.isoformat(timespec="seconds"),
+                              float(bar["close"]), float(ex_prem), reason)
+                print(f"      ✕ {strat} {pos['side']} exit @ ₹{ex_prem:.2f} — {reason}")
+                del open_pos[strat]
+        if t.time() > NO_NEW_ENTRY_AFTER:
+            continue
+        ctx = S.Context(now=eval_now, underlying=stock, exchange="NSE",
+                        spot=float(bar["close"]), idx5=fut_upto, fut5=fut_upto,
+                        prev_close=prev_close, today_open=today_open,
+                        is_expiry=False, oi=None)
+        for strat in FUT_STRATEGIES:
+            if strat in open_pos or J.has_trade_today(date_str, strat, stock):
+                continue
+            try:
+                sig = S.STRATEGIES[strat](ctx)
+            except Exception as e:
+                print(f"      ! {strat} error: {e}")
+                continue
+            if not sig:
+                continue
+            pos = _enter_fut(ctx, strat, sig, t, capital, price_cache)
+            if pos:
+                open_pos[strat] = pos
+
+    if open_pos:
+        t, bar = times[-1], fut.iloc[-1]
+        for strat, pos in open_pos.items():
+            J.close_trade(pos["id"], t.isoformat(timespec="seconds"),
+                          float(bar["close"]), float(bar["close"]), "EOD square-off (intraday)")
+            print(f"      ✕ {strat} {pos['side']} EOD square-off @ ₹{bar['close']:.2f}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="EOD replay of option-buying strategies")
     ap.add_argument("--date", help="YYYY-MM-DD (IST); default today")
@@ -233,10 +329,13 @@ def main():
         print(f"{date} is a weekend — nothing to replay.")
         return
 
-    print(f"EOD replay {date} | capital ₹{J.get_capital():,.0f} | "
-          f"{', '.join(u['name'] for u in UNDERLYINGS)}")
+    print(f"EOD replay {date} | capital ₹{J.get_capital():,.0f}")
+    print(f"  index options: {', '.join(u['name'] for u in UNDERLYINGS)}")
     for u in UNDERLYINGS:
         replay_underlying(u, date, today)
+    print(f"  stock futures (long+short): {', '.join(STOCK_FUTURES)}")
+    for stock in STOCK_FUTURES:
+        replay_future(stock, date, today)
     print("Done. Run build_journal.py to refresh the report.")
 
 

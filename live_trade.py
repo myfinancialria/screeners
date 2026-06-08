@@ -46,6 +46,13 @@ UNDERLYINGS = [
 ]
 _STEP = {u["name"]: u["step"] for u in UNDERLYINGS}
 
+# Liquid stock FUTURES (long+short). TATAMOTORS trades as TMPV post-demerger.
+STOCK_FUTURES = ["RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "TCS",
+                 "AXISBANK", "TMPV"]
+# Expiry-gamma is option/expiry-specific; futures run the price-action strategies only.
+FUT_STRATEGIES = ("ORB", "FIVE_EMA", "OI_GAP")
+FUT_MARGIN_PCT = 0.20    # rough SPAN+exposure margin proxy for futures sizing
+
 
 def atm_strike(name, spot):
     """Nearest ATM strike from the live index level (SENSEX has no futures to proxy
@@ -158,6 +165,38 @@ def size_lots(capital, entry_prem, sl_prem, lot_size):
     return max(1, min(max(1, by_risk), max(1, by_cost)))
 
 
+def size_lots_fut(capital, entry, sl, lot_size):
+    """Futures sizing: ~1% risk per trade, capped by a margin-deployment limit."""
+    risk_per_unit = max(abs(entry - sl), 0.002 * entry)
+    by_risk = int((capital * RISK_PCT) // (risk_per_unit * lot_size))
+    margin = max(entry * lot_size * FUT_MARGIN_PCT, 1)
+    by_margin = int((capital * MAX_DEPLOY_PCT) // margin)
+    return max(1, min(max(1, by_risk), max(1, by_margin)))
+
+
+def build_context_fut(stock, now):
+    """Context for a stock future — the future's own 5-min candles are the price series."""
+    try:
+        fut_sym, lot_size, _ = resolve_fo(stock, "FUT", exchange="NSE")
+    except (Exception, SystemExit):
+        return None
+    price = ltp(fut_sym).get(fut_sym)
+    if not price:
+        return None
+    f5 = _today_rows(get_history(fut_sym, "5", days=3), now)
+    if f5 is None or f5.empty:
+        return None
+    today_open = float(f5["open"].iloc[0])
+    dkey = (stock, now.date())
+    if dkey not in _daily_cache:
+        daily = get_history(fut_sym, "D", days=14)
+        prev = daily[[ix.date() < now.date() for ix in daily.index]]
+        _daily_cache[dkey] = float(prev["close"].iloc[-1]) if not prev.empty else today_open
+    return S.Context(now=now, underlying=stock, exchange="NSE", spot=float(price),
+                     idx5=f5, fut5=f5, prev_close=_daily_cache[dkey],
+                     today_open=today_open, is_expiry=False, oi=None)
+
+
 # ── entry ──────────────────────────────────────────────────────────────────────
 def try_enter(ctx, strat_name, sig, now):
     date = today_str(now)
@@ -201,28 +240,61 @@ def try_enter(ctx, strat_name, sig, now):
     print(f"      {sig.entry_remarks}")
 
 
+def try_enter_fut(ctx, strat_name, sig, now):
+    """Open a stock-FUTURES paper position (CE-signal -> LONG, PE-signal -> SHORT)."""
+    date = today_str(now)
+    if J.has_trade_today(date, strat_name, ctx.underlying):
+        return
+    if sig.sl_spot is None or sig.target_spot is None:
+        return  # futures need price-based stop & target
+    try:
+        fut_sym, lot_size, expiry = resolve_fo(ctx.underlying, "FUT", exchange="NSE")
+    except (Exception, SystemExit) as e:
+        print(f"    ! {strat_name}/{ctx.underlying}: no future ({e})")
+        return
+    price = ltp(fut_sym).get(fut_sym) or ctx.spot
+    side = "LONG" if sig.opt_kind == "CE" else "SHORT"
+    capital = J.get_capital()
+    lots = size_lots_fut(capital, price, sig.sl_spot, lot_size)
+    qty = lots * lot_size
+    risk_amt = abs(price - sig.sl_spot) * qty
+    remark = (sig.entry_remarks.replace("Bought ATM CE.", f"Went LONG {ctx.underlying} future.")
+              .replace("Bought ATM PE.", f"Went SHORT {ctx.underlying} future."))
+
+    tid = J.open_trade(
+        date=date, strategy=strat_name, underlying=ctx.underlying, exchange="NSE",
+        instrument_type="FUT", opt_symbol=fut_sym, opt_kind="FUT", side=side, strike=None,
+        lots=lots, lot_size=lot_size, qty=qty, entry_ts=now.isoformat(timespec="seconds"),
+        entry_spot=price, entry_prem=price, sl_spot=sig.sl_spot, target_spot=sig.target_spot,
+        sl_prem=None, target_prem=None, time_exit_min=None, risk_amt=risk_amt,
+        entry_remarks=remark, entry_logic=sig.entry_logic, sl_logic=sig.sl_logic,
+        exit_logic=sig.exit_logic)
+    print(f"  ➜ ENTER #{tid} {strat_name} {ctx.underlying} FUT {side} {fut_sym} "
+          f"{lots}lot×{lot_size} @ ₹{price:.2f}  (risk ₹{risk_amt:,.0f})")
+    print(f"      {remark}")
+
+
 # ── exit / monitor ─────────────────────────────────────────────────────────────
 def check_exit(t, prem, spot, now):
-    kind = t["opt_kind"]
-    # premium stop (always present)
+    # spot-direction: bullish = long the underlying move (CE option or LONG future)
+    bullish = t["opt_kind"] == "CE" or t["side"] == "LONG"
+    # premium stop / target (options only; futures have sl_prem/target_prem = NULL)
     if t["sl_prem"] is not None and prem <= t["sl_prem"]:
         return f"Stop hit — premium ₹{prem:.2f} ≤ stop ₹{t['sl_prem']:.2f}"
-    # premium target
     if t["target_prem"] is not None and prem >= t["target_prem"]:
         return f"Target hit — premium ₹{prem:.2f} ≥ ₹{t['target_prem']:.2f}"
-    # spot-based stop
+    # price/spot stop
     if t["sl_spot"] is not None:
-        if kind == "CE" and spot <= t["sl_spot"]:
-            return f"Stop hit — spot {spot:.1f} ≤ {t['sl_spot']:.1f}"
-        if kind == "PE" and spot >= t["sl_spot"]:
-            return f"Stop hit — spot {spot:.1f} ≥ {t['sl_spot']:.1f}"
-    # spot-based target
+        if bullish and spot <= t["sl_spot"]:
+            return f"Stop hit — price {spot:.1f} ≤ {t['sl_spot']:.1f}"
+        if not bullish and spot >= t["sl_spot"]:
+            return f"Stop hit — price {spot:.1f} ≥ {t['sl_spot']:.1f}"
+    # price/spot target
     if t["target_spot"] is not None:
-        if kind == "CE" and spot >= t["target_spot"]:
-            return f"Target hit — spot {spot:.1f} ≥ {t['target_spot']:.1f}"
-        if kind == "PE" and spot <= t["target_spot"]:
-            return f"Target hit — spot {spot:.1f} ≤ {t['target_spot']:.1f}"
-    # time exit
+        if bullish and spot >= t["target_spot"]:
+            return f"Target hit — price {spot:.1f} ≥ {t['target_spot']:.1f}"
+        if not bullish and spot <= t["target_spot"]:
+            return f"Target hit — price {spot:.1f} ≤ {t['target_spot']:.1f}"
     if t["time_exit_min"]:
         entered = dt.datetime.fromisoformat(t["entry_ts"])
         if (now - entered).total_seconds() >= t["time_exit_min"] * 60:
@@ -235,12 +307,14 @@ def monitor_open(spot_by_underlying, now, force_eod=False):
         prem = ltp(t["opt_symbol"]).get(t["opt_symbol"])
         if prem is None:
             continue
-        spot = spot_by_underlying.get(t["underlying"])
+        spot = spot_by_underlying.get(t["underlying"], prem)
         reason = "EOD square-off (intraday)" if force_eod else check_exit(t, prem, spot, now)
         if reason:
             J.close_trade(t["id"], now.isoformat(timespec="seconds"), spot, prem, reason)
-            pnl = (prem - t["entry_prem"]) * t["qty"]
-            print(f"  ✕ EXIT  #{t['id']} {t['strategy']} {t['underlying']} {t['opt_kind']} "
+            sign = -1 if t["side"] == "SHORT" else 1
+            pnl = sign * (prem - t["entry_prem"]) * t["qty"]
+            tag = t["side"] if t["instrument_type"] == "FUT" else t["opt_kind"]
+            print(f"  ✕ EXIT  #{t['id']} {t['strategy']} {t['underlying']} {tag} "
                   f"@ ₹{prem:.2f}  P&L ₹{pnl:,.0f}  — {reason}")
 
 
@@ -266,10 +340,20 @@ def run_pass(now):
         flags = "  [EXPIRY]" if ctx.is_expiry else ""
         print(f"  · {ctx.underlying} spot {ctx.spot:.1f}{flags}")
 
+    # stock futures (price-action strategies, long + short)
+    fut_contexts = []
+    for stock in STOCK_FUTURES:
+        ctx = build_context_fut(stock, now)
+        if ctx is None:
+            continue
+        spot_by_underlying[ctx.underlying] = ctx.spot
+        fut_contexts.append(ctx)
+        print(f"  · {stock} FUT {ctx.spot:.1f}")
+
     # monitor existing positions first (so a same-poll target/stop is honoured)
     monitor_open(spot_by_underlying, now)
 
-    # then look for fresh entries
+    # then look for fresh entries — options on indices
     for ctx in contexts:
         for strat_name, fn in S.STRATEGIES.items():
             try:
@@ -279,6 +363,17 @@ def run_pass(now):
                 continue
             if sig:
                 try_enter(ctx, strat_name, sig, now)
+
+    # futures on liquid stocks
+    for ctx in fut_contexts:
+        for strat_name in FUT_STRATEGIES:
+            try:
+                sig = S.STRATEGIES[strat_name](ctx)
+            except Exception as e:
+                print(f"    ! {strat_name}/{ctx.underlying} error: {e}")
+                continue
+            if sig:
+                try_enter_fut(ctx, strat_name, sig, now)
 
 
 # ── loop ───────────────────────────────────────────────────────────────────────
@@ -294,8 +389,9 @@ def main():
     if args.capital:
         J.set_capital(args.capital)
     print(f"Live engine | capital ₹{J.get_capital():,.0f} | "
-          f"strategies: {', '.join(S.STRATEGIES)} | underlyings: "
-          f"{', '.join(u['name'] for u in UNDERLYINGS)}")
+          f"strategies: {', '.join(S.STRATEGIES)}\n"
+          f"  index options: {', '.join(u['name'] for u in UNDERLYINGS)} | "
+          f"stock futures (long+short): {', '.join(STOCK_FUTURES)}")
     print("Ctrl-C to stop.\n")
 
     squared_off = False

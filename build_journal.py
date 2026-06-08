@@ -131,21 +131,25 @@ def build():
         cls = ""
         if t["status"] == "CLOSED":
             cls = "pos" if (t["pnl"] or 0) >= 0 else "neg"
-        pnl_cell = (f"<span class='{cls}'>{_fmt(t['pnl'], money=True)} "
-                    f"({t['pnl_pct']:+.0f}%)</span>" if t["status"] == "CLOSED"
-                    else "<span class='muted'>OPEN</span>")
+        if t["status"] != "CLOSED":
+            pnl_cell = "<span class='muted'>OPEN</span>"
+        elif _is_fut(t):   # premium-% is meaningless for futures; show rupees only
+            pnl_cell = f"<span class='{cls}'>{_fmt(t['pnl'], money=True)}</span>"
+        else:
+            pnl_cell = (f"<span class='{cls}'>{_fmt(t['pnl'], money=True)} "
+                        f"({t['pnl_pct']:+.0f}%)</span>")
         rcell = f"{t['r_multiple']:+.2f}R" if t["r_multiple"] is not None else "—"
         det.append(f"""
         <tr class="hdr">
           <td>#{t['id']}</td><td>{html.escape(t['date'])}</td>
           <td><b>{html.escape(t['strategy'])}</b></td>
-          <td>{html.escape(t['underlying'])} {html.escape(t['opt_kind'])}</td>
+          <td>{html.escape(inst_label(t))}</td>
           <td>{html.escape(t['opt_symbol'])}</td>
           <td>{t['lots']}×{t['lot_size']}</td>
           <td>{pnl_cell}</td><td>{rcell}</td>
         </tr>
         <tr class="detail"><td colspan="8">
-          <div class="kv"><span>Entry</span> {now_or(t['entry_ts'])} · spot {_fmt(t['entry_spot'])} · premium ₹{_fmt(t['entry_prem'])}</div>
+          <div class="kv"><span>Entry</span> {entry_str(t)}</div>
           <div class="kv"><span>Target</span> {tgt_str(t)}</div>
           <div class="kv"><span>Stop</span> {sl_str(t)}</div>
           <div class="kv"><span>Exit</span> {exit_str(t)}</div>
@@ -174,34 +178,68 @@ def build():
 
 # small formatting helpers used inside the f-string above
 def now_or(ts):
-    return html.escape(ts.replace("T", " ")) if ts else "—"
+    if not ts:
+        return "—"
+    s = ts.replace("T", " ").split("+")[0]   # drop tz offset like +05:30
+    return html.escape(s)
+
+
+def _is_fut(t):
+    return t.get("instrument_type") == "FUT"
+
+
+def inst_label(t):
+    return (f"{t['underlying']} FUT {t['side']}" if _is_fut(t)
+            else f"{t['underlying']} {t['opt_kind']}")
+
+
+def _underlying_word(t):
+    return "price" if _is_fut(t) else "index"
+
+
+def entry_str(t):
+    """Exact fill price + time of entry."""
+    s = f"₹{_fmt(t['entry_prem'])} at {now_or(t['entry_ts'])}"
+    if not _is_fut(t) and t["entry_spot"] is not None:
+        s += f" · {_underlying_word(t)} {_fmt(t['entry_spot'])}"
+    return s
 
 
 def tgt_str(t):
-    bits = []
-    if t["target_spot"] is not None:
-        bits.append(f"spot {_fmt(t['target_spot'])}")
+    plan = []
     if t["target_prem"] is not None:
-        bits.append(f"premium ₹{_fmt(t['target_prem'])}")
+        plan.append(f"₹{_fmt(t['target_prem'])}")
+    if t["target_spot"] is not None:
+        plan.append(f"{_underlying_word(t)} {_fmt(t['target_spot'])}")
     if t["time_exit_min"]:
-        bits.append(f"time-exit {t['time_exit_min']}min")
-    return html.escape(" · ".join(bits)) if bits else "—"
+        plan.append(f"time-exit {t['time_exit_min']}min")
+    s = " / ".join(plan) if plan else "—"
+    if t.get("tgt_hit_ts"):
+        s += f"  →  <b class='pos'>HIT ₹{_fmt(t['tgt_hit_price'])} at {now_or(t['tgt_hit_ts'])}</b>"
+    elif t["status"] == "CLOSED":
+        s += "  · not hit"
+    return s
 
 
 def sl_str(t):
-    bits = []
-    if t["sl_spot"] is not None:
-        bits.append(f"spot {_fmt(t['sl_spot'])}")
+    plan = []
     if t["sl_prem"] is not None:
-        bits.append(f"premium ₹{_fmt(t['sl_prem'])}")
-    return html.escape(" · ".join(bits)) if bits else "—"
+        plan.append(f"₹{_fmt(t['sl_prem'])}")
+    if t["sl_spot"] is not None:
+        plan.append(f"{_underlying_word(t)} {_fmt(t['sl_spot'])}")
+    s = " / ".join(plan) if plan else "—"
+    if t.get("sl_hit_ts"):
+        s += f"  →  <b class='neg'>HIT ₹{_fmt(t['sl_hit_price'])} at {now_or(t['sl_hit_ts'])}</b>"
+    elif t["status"] == "CLOSED":
+        s += "  · not hit"
+    return s
 
 
 def exit_str(t):
     if t["status"] != "CLOSED":
         return "—"
-    return html.escape(f"{now_or(t['exit_ts'])} · spot {_fmt(t['exit_spot'])} · "
-                       f"premium ₹{_fmt(t['exit_prem'])} · {t['exit_reason']}")
+    return (f"₹{_fmt(t['exit_prem'])} at {now_or(t['exit_ts'])} · "
+            f"{html.escape(t['exit_reason'] or '')}")
 
 
 STRATEGY_SHOWCASE = """
@@ -257,15 +295,12 @@ def write_landing(trades, st, per, now):
     rrows = []
     for t in recent:
         cls = "pos" if (t["pnl"] or 0) >= 0 else "neg"
+        rmult = f"{t['r_multiple']:+.2f}R" if t["r_multiple"] is not None else "—"
         rrows.append(
             f"<tr><td>{html.escape(t['date'])}</td><td><b>{html.escape(t['strategy'])}</b></td>"
-            f"<td>{html.escape(t['underlying'])} {html.escape(t['opt_kind'])}</td>"
+            f"<td>{html.escape(inst_label(t))}</td>"
             f"<td class='r {cls}'>{_fmt(t['pnl'], money=True)}</td>"
-            f"<td class='r {cls}'>{t['r_multiple']:+.2f}R</td></tr>"
-            if t["r_multiple"] is not None else
-            f"<tr><td>{html.escape(t['date'])}</td><td><b>{html.escape(t['strategy'])}</b></td>"
-            f"<td>{html.escape(t['underlying'])} {html.escape(t['opt_kind'])}</td>"
-            f"<td class='r {cls}'>{_fmt(t['pnl'], money=True)}</td><td class='r'>—</td></tr>")
+            f"<td class='r {cls}'>{rmult}</td></tr>")
     recent_html = ("<table><tr><th>Date</th><th>Strategy</th><th>Instrument</th>"
                    "<th class='r'>P&L</th><th class='r'>R</th></tr>"
                    + ("".join(rrows) or "<tr><td colspan=5 class='muted'>First session "
@@ -311,9 +346,10 @@ LANDING = """<!doctype html><html lang="en"><head>
 </style></head><body>
 <div class="hero"><div class="wrap" style="padding-top:0">
  <h1>📈 Option Strategy Lab</h1>
- <p>Four researched option-BUYING strategies — ORB, 5 EMA (Power of Stocks), Expiry
-    Gamma and OI+Gap — traded automatically on NIFTY &amp; SENSEX as paper trades, with
-    every entry, exit and stop journalled in full. Updated daily after market close.</p>
+ <p>Four researched strategies — ORB, 5 EMA (Power of Stocks), Expiry Gamma and OI+Gap
+    — traded automatically as paper trades: option BUYING on NIFTY &amp; SENSEX and
+    LONG/SHORT on liquid stock futures, with every entry, exit and stop journalled in
+    full. Updated daily after market close.</p>
  <div class="pill">Virtual capital {capital} · automated · simulated, no real orders</div>
 </div></div>
 <div class="wrap">
@@ -374,7 +410,7 @@ TEMPLATE = """<!doctype html><html lang="en"><head>
  .disc{{margin-top:22px;color:var(--mut);font-size:11.5px;border-top:1px solid var(--bd);padding-top:12px}}
 </style></head><body>
 <header><h1>Strategy Paper-Trading Journal</h1>
- <div class="sub">Virtual capital {capital} · option-buying engine (ORB · 5 EMA · Expiry Gamma · OI+Gap) · updated {now} · simulated, no real orders</div>
+ <div class="sub">Virtual capital {capital} · index options + stock futures (ORB · 5 EMA · Expiry Gamma · OI+Gap) · updated {now} · simulated, no real orders</div>
  <div class="nav"><a href="index.html">🏠 Home</a> · <a href="screener.html">NSE Bullish Screener</a> · <a href="performance.html">📊 Screener performance</a></div>
 </header>
 <div class="tabs">

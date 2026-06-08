@@ -4,9 +4,9 @@ Strategy paper-trading journal — a local SQLite store (nothing leaves your mac
 DB lives at  fyers-connect/strategy.db  (separate from the manual paper.db).
 
 Every automated trade is one row carrying the FULL story: which strategy fired,
-why it entered, the planned target & stop, the *logic* behind each, and on exit
-the realised P&L, R-multiple and the exact reason it was closed. That is what the
-journal / performance reports read back.
+why it entered, the EXACT entry price & time, the planned target & stop, the *logic*
+behind each, and on exit the realised P&L plus the exact price & time the stop or
+target was hit. Handles both option BUYING (CE/PE) and stock FUTURES (long/short).
 """
 from __future__ import annotations
 
@@ -18,6 +18,16 @@ DB_PATH = Path(__file__).with_name("strategy.db")
 # Virtual starting capital (₹).  Change with: journal_db.set_capital(amount)
 DEFAULT_CAPITAL = 1_000_000.0
 
+# Columns added after the first release — migrated onto existing DBs automatically.
+_EXTRA_COLS = {
+    "instrument_type": "TEXT DEFAULT 'OPT'",   # OPT | FUT
+    "side": "TEXT DEFAULT 'BUY'",              # BUY (options) | LONG | SHORT (futures)
+    "sl_hit_ts": "TEXT",
+    "sl_hit_price": "REAL",
+    "tgt_hit_ts": "TEXT",
+    "tgt_hit_price": "REAL",
+}
+
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -25,48 +35,62 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(c) -> None:
+    have = {r["name"] for r in c.execute("PRAGMA table_info(journal)")}
+    for col, decl in _EXTRA_COLS.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE journal ADD COLUMN {col} {decl}")
+
+
 def init() -> None:
     with connect() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS journal (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                date          TEXT    NOT NULL,   -- YYYY-MM-DD (IST)
+                date          TEXT    NOT NULL,
                 strategy      TEXT    NOT NULL,
-                underlying    TEXT    NOT NULL,   -- NIFTY | SENSEX
-                exchange      TEXT    NOT NULL,   -- NSE | BSE
-                opt_symbol    TEXT    NOT NULL,   -- resolved Fyers option symbol
-                opt_kind      TEXT    NOT NULL,   -- CE | PE
+                underlying    TEXT    NOT NULL,
+                exchange      TEXT    NOT NULL,
+                instrument_type TEXT  DEFAULT 'OPT',   -- OPT | FUT
+                opt_symbol    TEXT    NOT NULL,         -- option or future Fyers symbol
+                opt_kind      TEXT    NOT NULL,         -- CE | PE | FUT
+                side          TEXT    DEFAULT 'BUY',    -- BUY | LONG | SHORT
                 strike        REAL,
                 lots          INTEGER NOT NULL,
                 lot_size      INTEGER NOT NULL,
-                qty           INTEGER NOT NULL,   -- lots * lot_size
-                status        TEXT    NOT NULL,   -- OPEN | CLOSED
+                qty           INTEGER NOT NULL,
+                status        TEXT    NOT NULL,         -- OPEN | CLOSED
 
-                entry_ts      TEXT    NOT NULL,
+                entry_ts      TEXT    NOT NULL,         -- exact fill time
                 entry_spot    REAL,
-                entry_prem    REAL    NOT NULL,
+                entry_prem    REAL    NOT NULL,         -- exact fill price (premium or future px)
 
-                sl_spot       REAL,               -- spot level that trips the stop
-                target_spot   REAL,               -- spot level that books target
-                sl_prem       REAL,               -- premium level that trips the stop
-                target_prem   REAL,               -- premium level that books target
-                time_exit_min INTEGER,            -- hard time-based exit (minutes)
-                risk_amt      REAL,               -- ₹ risked at entry (for R-multiple)
+                sl_spot       REAL,
+                target_spot   REAL,
+                sl_prem       REAL,
+                target_prem   REAL,
+                time_exit_min INTEGER,
+                risk_amt      REAL,
 
                 exit_ts       TEXT,
                 exit_spot     REAL,
                 exit_prem     REAL,
                 exit_reason   TEXT,
+                sl_hit_ts     TEXT,                     -- exact time stop was hit
+                sl_hit_price  REAL,                     -- exact price stop filled
+                tgt_hit_ts    TEXT,                     -- exact time target was hit
+                tgt_hit_price REAL,                     -- exact price target filled
                 pnl           REAL,
                 pnl_pct       REAL,
                 r_multiple    REAL,
 
-                entry_remarks TEXT,   -- WHY it entered (plain-English remark)
-                entry_logic   TEXT,   -- the entry rule that fired
-                sl_logic      TEXT,   -- the stop-loss rule
-                exit_logic    TEXT    -- the planned exit / target rule
+                entry_remarks TEXT,
+                entry_logic   TEXT,
+                sl_logic      TEXT,
+                exit_logic    TEXT
             )
         """)
+        _migrate(c)
         c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)")
         if c.execute("SELECT val FROM meta WHERE key='capital'").fetchone() is None:
             c.execute("INSERT INTO meta(key,val) VALUES('capital',?)",
@@ -85,41 +109,53 @@ def set_capital(amount: float) -> None:
                   "ON CONFLICT(key) DO UPDATE SET val=excluded.val", (str(amount),))
 
 
+_OPEN_COLS = [
+    "date", "strategy", "underlying", "exchange", "instrument_type", "opt_symbol",
+    "opt_kind", "side", "strike", "lots", "lot_size", "qty", "status", "entry_ts",
+    "entry_spot", "entry_prem", "sl_spot", "target_spot", "sl_prem", "target_prem",
+    "time_exit_min", "risk_amt", "entry_remarks", "entry_logic", "sl_logic", "exit_logic",
+]
+
+
 def open_trade(**kw) -> int:
-    """Insert a new OPEN trade. Pass keyword columns; missing ones default to NULL."""
-    cols = [
-        "date", "strategy", "underlying", "exchange", "opt_symbol", "opt_kind",
-        "strike", "lots", "lot_size", "qty", "status", "entry_ts", "entry_spot",
-        "entry_prem", "sl_spot", "target_spot", "sl_prem", "target_prem",
-        "time_exit_min", "risk_amt", "entry_remarks", "entry_logic", "sl_logic",
-        "exit_logic",
-    ]
     kw.setdefault("status", "OPEN")
-    vals = [kw.get(col) for col in cols]
+    kw.setdefault("instrument_type", "OPT")
+    kw.setdefault("side", "BUY")
+    vals = [kw.get(col) for col in _OPEN_COLS]
     with connect() as c:
         c.execute(
-            f"INSERT INTO journal({','.join(cols)}) "
-            f"VALUES({','.join('?' for _ in cols)})", vals,
+            f"INSERT INTO journal({','.join(_OPEN_COLS)}) "
+            f"VALUES({','.join('?' for _ in _OPEN_COLS)})", vals,
         )
         return c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
 
 def close_trade(trade_id, exit_ts, exit_spot, exit_prem, exit_reason):
-    """Close an OPEN trade and compute P&L / R-multiple (option BUYING only)."""
+    """Close a trade, compute side-aware P&L, and record the exact SL/target hit."""
     with connect() as c:
         row = c.execute("SELECT * FROM journal WHERE id=?", (trade_id,)).fetchone()
         if row is None or row["status"] == "CLOSED":
             return
         qty = row["qty"]
         entry = row["entry_prem"]
-        pnl = (exit_prem - entry) * qty
-        pnl_pct = (exit_prem / entry - 1.0) * 100.0 if entry else 0.0
+        sign = -1.0 if row["side"] == "SHORT" else 1.0      # short futures profit when px falls
+        pnl = sign * (exit_prem - entry) * qty
+        pnl_pct = sign * (exit_prem / entry - 1.0) * 100.0 if entry else 0.0
         risk = row["risk_amt"] or 0.0
         r_mult = (pnl / risk) if risk else None
+
+        sl_hit_ts = sl_hit_price = tgt_hit_ts = tgt_hit_price = None
+        if exit_reason.startswith("Stop"):
+            sl_hit_ts, sl_hit_price = exit_ts, exit_prem
+        elif exit_reason.startswith("Target"):
+            tgt_hit_ts, tgt_hit_price = exit_ts, exit_prem
+
         c.execute(
             "UPDATE journal SET status='CLOSED', exit_ts=?, exit_spot=?, exit_prem=?, "
-            "exit_reason=?, pnl=?, pnl_pct=?, r_multiple=? WHERE id=?",
-            (exit_ts, exit_spot, exit_prem, exit_reason, pnl, pnl_pct, r_mult, trade_id),
+            "exit_reason=?, sl_hit_ts=?, sl_hit_price=?, tgt_hit_ts=?, tgt_hit_price=?, "
+            "pnl=?, pnl_pct=?, r_multiple=? WHERE id=?",
+            (exit_ts, exit_spot, exit_prem, exit_reason, sl_hit_ts, sl_hit_price,
+             tgt_hit_ts, tgt_hit_price, pnl, pnl_pct, r_mult, trade_id),
         )
 
 
@@ -135,7 +171,6 @@ def all_trades():
 
 
 def has_trade_today(date, strategy, underlying) -> bool:
-    """True if this strategy already fired on this underlying today (1 trade/day cap)."""
     with connect() as c:
         row = c.execute(
             "SELECT 1 FROM journal WHERE date=? AND strategy=? AND underlying=? LIMIT 1",
